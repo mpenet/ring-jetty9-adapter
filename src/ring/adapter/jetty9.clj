@@ -1,23 +1,44 @@
 (ns ring.adapter.jetty9
   "Adapter for the Jetty 9 server, with websocket support.
 Derived from ring.adapter.jetty"
-  (:import (org.eclipse.jetty.server
-            Handler Server Request ServerConnector
-            HttpConfiguration HttpConnectionFactory SslConnectionFactory ConnectionFactory)
-           (org.eclipse.jetty.server.handler
-            HandlerCollection AbstractHandler ContextHandler HandlerList)
-           (org.eclipse.jetty.util.thread
-            QueuedThreadPool ScheduledExecutorScheduler)
-           (org.eclipse.jetty.util.ssl SslContextFactory)
-           (org.eclipse.jetty.websocket.server WebSocketHandler)
-           (org.eclipse.jetty.websocket.servlet WebSocketServletFactory WebSocketCreator ServletUpgradeRequest
-                                                ServletUpgradeResponse)
-           (javax.servlet.http HttpServletRequest HttpServletResponse)
-           (org.eclipse.jetty.websocket.api WebSocketAdapter Session UpgradeRequest)
-           (java.nio ByteBuffer)
-           (clojure.lang IFn))
-  (:require [ring.util.servlet :as servlet]
-            [clojure.string :as string]))
+  (:require
+   [ring.util.servlet :as servlet]
+   [clojure.string :as string]
+   [clojure.core.async :as async])
+  (:import
+   (org.eclipse.jetty.server
+    Handler
+    Server
+    Request
+    ServerConnector
+    HttpConfiguration
+    HttpConnectionFactory
+    SslConnectionFactory
+    ConnectionFactory)
+   (org.eclipse.jetty.server.handler
+    HandlerCollection
+    AbstractHandler
+    ContextHandler
+    HandlerList)
+   (org.eclipse.jetty.util.thread
+    QueuedThreadPool
+    ScheduledExecutorScheduler)
+   (org.eclipse.jetty.util.ssl SslContextFactory)
+   (org.eclipse.jetty.websocket.server WebSocketHandler)
+   (org.eclipse.jetty.websocket.servlet
+    WebSocketServletFactory
+    WebSocketCreator
+    ServletUpgradeRequest
+    ServletUpgradeResponse)
+   (javax.servlet.http
+    HttpServletRequest
+    HttpServletResponse)
+   (org.eclipse.jetty.websocket.api
+    WebSocketAdapter
+    Session
+    UpgradeRequest)
+   (java.nio ByteBuffer)
+   (clojure.lang IFn)))
 
 (defprotocol WebSocketProtocol
   (send! [this msg])
@@ -69,33 +90,42 @@ Derived from ring.adapter.jetty"
 
 (defn- do-nothing [& args])
 
+(defrecord WebSocketBinaryFrame [payload offset len])
+
+(defn close-chans!
+  [& chs]
+  (doseq [ch chs]
+    (async/close! ch)))
+
+(use 'clojure.tools.logging)
+
 (defn- proxy-ws-adapter
-  [{:as ws-fns
-    :keys [on-connect on-error on-text on-close on-bytes]
-    :or {on-connect do-nothing
-         on-error do-nothing
-         on-text do-nothing
-         on-close do-nothing
-         on-bytes do-nothing}}]
-  (proxy [WebSocketAdapter] []
-    (onWebSocketConnect [^Session session]
-      (proxy-super onWebSocketConnect session)
-      (on-connect this))
-    (onWebSocketError [^Throwable e]
-      (on-error this e))
-    (onWebSocketText [^String message]
-      (on-text this message))
-    (onWebSocketClose [statusCode ^String reason]
-      (proxy-super onWebSocketClose statusCode reason)
-      (on-close this statusCode reason))
-    (onWebSocketBinary [^bytes payload offset len]
-      (on-bytes this payload offset len))))
+  [handler]
+  (let [recv-ch (async/chan)
+        send-ch (async/chan)
+        ctrl-ch (async/chan)]
+    (proxy [WebSocketAdapter] []
+      (onWebSocketConnect [^Session session]
+        (proxy-super onWebSocketConnect session)
+        (async/put! ctrl-ch [::connected this])
+        (handler {:recv-ch recv-ch :send-ch send-ch :ctrl-ch ctrl-ch :ws this}))
+      (onWebSocketError [^Throwable e]
+        (async/put! ctrl-ch [:error this e])
+        (close-chans! recv-ch send-ch ctrl-ch))
+      (onWebSocketText [^String message]
+        (async/put! recv-ch message))
+      (onWebSocketClose [statusCode ^String reason]
+        (proxy-super onWebSocketClose statusCode reason)
+        (async/put! ctrl-ch [::close this reason])
+        (close-chans! recv-ch send-ch ctrl-ch))
+      (onWebSocketBinary [^bytes payload offset len]
+        (async/put! recv-ch (WebSocketBinaryFrame. payload offset len))))))
 
 (defn- reify-ws-creator
-  [ws-fns]
+  [handler]
   (reify WebSocketCreator
     (createWebSocket [this _ _]
-      (proxy-ws-adapter ws-fns))))
+      (proxy-ws-adapter handler))))
 
 (defprotocol RequestMapDecoder
   (build-request-map [r]))
@@ -119,14 +149,14 @@ Derived from ring.adapter.jetty"
 
 (defn- proxy-ws-handler
   "Returns a Jetty websocket handler"
-  [ws-fns {:as options
-           :keys [ws-max-idle-time]
-           :or {ws-max-idle-time 500000}}]
+  [handlers {:as options
+             :keys [ws-max-idle-time]
+             :or {ws-max-idle-time 500000}}]
   (proxy [WebSocketHandler] []
     (configure [^WebSocketServletFactory factory]
       (-> (.getPolicy factory)
           (.setIdleTimeout ws-max-idle-time))
-      (.setCreator factory (reify-ws-creator ws-fns)))))
+      (.setCreator factory (reify-ws-creator handlers)))))
 
 (defn- proxy-handler
   "Returns an Jetty Handler implementation for the given Ring handler."
@@ -274,3 +304,29 @@ supplied options:
     (when join?
       (.join s))
     s))
+
+
+(comment
+  (run-jetty nil {:port 8013
+                 :websockets {"/api/entries/realtime/"
+                              (fn [{:keys [recv-ch send-ch ctrl-ch ws]
+                                    :as opts}]
+                                (async/go
+                                  (loop []
+                                    (let [x (async/<! ctrl-ch)]
+                                      (info :ctrl x ctrl-ch)
+                                      (recur))))
+                                (async/go
+                                  (loop []
+                                    (let [x (async/<! recv-ch)]
+                                      (info :recv x recv-ch)
+                                      (recur))))
+
+                                (async/go
+                                  (loop []
+                                    (let [x (async/<! send-ch)]
+                                      (info :send x send-ch)
+                                      (recur))))
+
+                                ;; (close! ws)
+                                )}}))
