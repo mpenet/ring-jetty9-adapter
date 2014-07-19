@@ -110,13 +110,13 @@ Derived from ring.adapter.jetty"
         (async/put! ctrl-ch [::connected this])
         (handler {:recv-ch recv-ch :send-ch send-ch :ctrl-ch ctrl-ch :ws this}))
       (onWebSocketError [^Throwable e]
-        (async/put! ctrl-ch [:error this e])
+        (async/put! ctrl-ch [:error e])
         (close-chans! recv-ch send-ch ctrl-ch))
       (onWebSocketText [^String message]
         (async/put! recv-ch message))
       (onWebSocketClose [statusCode ^String reason]
         (proxy-super onWebSocketClose statusCode reason)
-        (async/put! ctrl-ch [::close this reason])
+        (async/put! ctrl-ch [::close reason])
         (close-chans! recv-ch send-ch ctrl-ch))
       (onWebSocketBinary [^bytes payload offset len]
         (async/put! recv-ch (WebSocketBinaryFrame. payload offset len))))))
